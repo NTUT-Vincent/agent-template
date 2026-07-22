@@ -1,19 +1,31 @@
 from __future__ import annotations
 
 from a2a.server.request_handlers import DefaultRequestHandler
-from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
+from a2a.server.routes import (
+    add_a2a_routes_to_fastapi,
+    create_agent_card_routes,
+    create_jsonrpc_routes,
+)
 from a2a.server.tasks import DatabaseTaskStore
 from a2a.types import AgentCapabilities, AgentCard, AgentInterface, AgentSkill
+from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import AsyncEngine
-from starlette.applications import Starlette
 
 
-async def create_a2a_app(*, executor, public_url: str, engine: AsyncEngine) -> Starlette:
-    """Build an A2A Protocol 1.0 server using the official A2A Python SDK.
+async def add_a2a_routes(
+    app: FastAPI,
+    *,
+    executor,
+    public_url: str,
+    engine: AsyncEngine,
+) -> None:
+    """Register the official A2A 1.0 JSON-RPC surface on the main FastAPI app.
 
-    A2A originated at Google and is now maintained by the A2A Project. The
-    official Python package remains ``a2a-sdk``. Task state is persisted in
-    PostgreSQL so A2A task lifecycle is not tied to a single Kubernetes Pod.
+    Public protocol endpoints:
+    - GET /.well-known/agent-card.json
+    - POST /a2a (A2A JSON-RPC methods, including streaming over SSE)
+
+    A2A protocol task state is owned by the official SDK and persisted in PostgreSQL.
     """
     skill = AgentSkill(
         id="general_agent",
@@ -30,7 +42,11 @@ async def create_a2a_app(*, executor, public_url: str, engine: AsyncEngine) -> S
         version="0.1.0",
         capabilities=AgentCapabilities(streaming=True),
         supported_interfaces=[
-            AgentInterface(protocol_binding="JSONRPC", url=public_url, protocol_version="1.0")
+            AgentInterface(
+                protocol_binding="JSONRPC",
+                url=public_url,
+                protocol_version="1.0",
+            )
         ],
         skills=[skill],
         default_input_modes=["text/plain"],
@@ -49,5 +65,9 @@ async def create_a2a_app(*, executor, public_url: str, engine: AsyncEngine) -> S
         task_store=task_store,
         agent_card=card,
     )
-    routes = [*create_agent_card_routes(card), *create_jsonrpc_routes(handler, "/")]
-    return Starlette(routes=routes)
+
+    add_a2a_routes_to_fastapi(
+        app,
+        agent_card_routes=create_agent_card_routes(card),
+        jsonrpc_routes=create_jsonrpc_routes(handler, rpc_url="/a2a"),
+    )
