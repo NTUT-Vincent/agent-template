@@ -1,7 +1,7 @@
 [project]
 name = "agent-runtime-platform"
 version = "0.1.0"
-description = "Kubernetes-ready agent runtime using LangGraph, PostgreSQL, Claude Agent SDK, A2A and Celery."
+description = "Kubernetes-ready agent runtime using LangGraph, PostgreSQL, Claude Agent SDK, the official A2A Python SDK and Celery."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
