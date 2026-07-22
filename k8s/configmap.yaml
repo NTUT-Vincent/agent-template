@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-runtime-config
+data:
+  APP_ENV: prod
+  API_HOST: 0.0.0.0
+  API_PORT: "8000"
+  CLAUDE_MODEL: claude-sonnet-4-5
+  CLAUDE_MAX_TURNS: "8"
+  CLAUDE_PROJECT_KEY: agent-runtime
+  LANGGRAPH_STRICT_MSGPACK: "true"

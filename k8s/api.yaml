@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-runtime-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: agent-runtime-api}
+  template:
+    metadata:
+      labels: {app: agent-runtime-api}
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/REPLACE_ME/agent-runtime-platform:latest
+          ports: [{containerPort: 8000}]
+          envFrom:
+            - configMapRef: {name: agent-runtime-config}
+            - secretRef: {name: agent-runtime-secrets}
+          readinessProbe:
+            httpGet: {path: /health, port: 8000}
+          livenessProbe:
+            httpGet: {path: /health, port: 8000}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-runtime-api
+spec:
+  selector: {app: agent-runtime-api}
+  ports:
+    - port: 80
+      targetPort: 8000

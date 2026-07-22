@@ -1,0 +1,46 @@
+[project]
+name = "agent-runtime-platform"
+version = "0.1.0"
+description = "Kubernetes-ready agent runtime using LangGraph, PostgreSQL, Claude Agent SDK, A2A and Celery."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.128,<1",
+  "uvicorn[standard]>=0.35,<1",
+  "pydantic-settings>=2.10,<3",
+  "sqlalchemy[asyncio]>=2.0,<3",
+  "asyncpg>=0.30,<1",
+  "psycopg[binary,pool]>=3.2,<4",
+  "langgraph>=1.2.9,<2",
+  "langgraph-checkpoint-postgres>=3.1,<4",
+  "claude-agent-sdk>=0.2.123,<0.3",
+  "celery[redis]>=5.5,<6",
+  "a2a-sdk[http-server,postgresql]>=1.1.1,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx>=0.28,<1",
+  "pytest>=8.4,<9",
+  "pytest-asyncio>=1.1,<2",
+  "ruff>=0.12,<1",
+  "mypy>=1.17,<2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_runtime"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
