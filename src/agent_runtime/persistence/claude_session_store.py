@@ -1,7 +1,30 @@
-"""Postgres-backed Claude Agent SDK SessionStore.
+"""Claude Agent SDK 的 PostgreSQL SessionStore 實作。
 
-Adapted from Anthropic's reference contract: one JSONB row per transcript entry,
-with a composite logical key of project_key/session_id/subpath.
+為什麼這個檔案存在？
+
+Claude Agent SDK 自己有 native session / resume 概念。若 transcript 只存在 Pod local disk：
+
+    Pod A 執行 Agent
+      -> session transcript 寫在 Pod A
+      -> Pod A 被 Kubernetes 重建
+      -> Pod B 收到下一輪 request
+      -> 找不到原本 session transcript
+
+所以這個範本把 SDK native session transcript 鏡像到 PostgreSQL。
+
+注意：
+這不是 LangGraph checkpoint，也不是 Long-term memory。
+
+三者責任：
+
+    LangGraph PostgresSaver
+        -> workflow/thread state
+
+    LangGraph PostgresStore
+        -> cross-thread long-term memory
+
+    PostgresClaudeSessionStore
+        -> Claude Agent SDK native transcript / resume
 """
 from __future__ import annotations
 
@@ -17,10 +40,24 @@ from claude_agent_sdk import (
     SessionStoreListEntry,
 )
 
+# Table name 會被插入 SQL identifier，不能讓任意字串進來。
+# 值本身仍使用 asyncpg parameter binding，避免把資料字串直接拼 SQL。
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class PostgresClaudeSessionStore(SessionStore):
+    """Claude Agent SDK SessionStore protocol 的 PostgreSQL implementation。
+
+    資料模型使用：
+
+        project_key
+          + session_id
+          + subpath
+          + seq
+
+    其中 seq 保留 transcript entry 的順序。
+    """
+
     def __init__(self, pool: asyncpg.Pool, table: str = "claude_session_store") -> None:
         if not _IDENT.fullmatch(table):
             raise ValueError("invalid session-store table name")
@@ -28,6 +65,11 @@ class PostgresClaudeSessionStore(SessionStore):
         self._table = table
 
     async def setup(self) -> None:
+        """建立 SDK session store table/index。
+
+        Reference template 為了方便教學直接在 startup setup。
+        正式 production 建議把 schema 交給 migration 管理。
+        """
         await self._pool.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {self._table} (
@@ -46,8 +88,14 @@ class PostgresClaudeSessionStore(SessionStore):
         )
 
     async def append(self, key: SessionKey, entries: list[SessionStoreEntry]) -> None:
+        """把 SDK 新產生的 transcript entries 依序 append 到 PostgreSQL。
+
+        ClaudeAgentOptions(session_store_flush="eager") 會更積極呼叫這類持久化操作，
+        因此 Pod crash 或跨 process resume 時比較不依賴 local state。
+        """
         if not entries:
             return
+
         await self._pool.execute(
             f"""
             INSERT INTO {self._table} (project_key, session_id, subpath, entry, mtime)
@@ -63,6 +111,10 @@ class PostgresClaudeSessionStore(SessionStore):
         )
 
     async def load(self, key: SessionKey) -> list[SessionStoreEntry] | None:
+        """依 session key 讀回完整 transcript entries。
+
+        resume=<sdk_session_id> 時，SDK 可以透過 SessionStore 取得之前的 session 資料。
+        """
         rows = await self._pool.fetch(
             f"""
             SELECT entry FROM {self._table}
@@ -73,8 +125,10 @@ class PostgresClaudeSessionStore(SessionStore):
             key["session_id"],
             key.get("subpath") or "",
         )
+
         if not rows:
             return None
+
         values: list[SessionStoreEntry] = []
         for row in rows:
             entry = row["entry"]
@@ -82,6 +136,7 @@ class PostgresClaudeSessionStore(SessionStore):
         return values
 
     async def list_sessions(self, project_key: str) -> list[SessionStoreListEntry]:
+        """列出某個 project_key 底下可 resume 的 SDK sessions。"""
         rows = await self._pool.fetch(
             f"""
             SELECT session_id, MAX(mtime) AS mtime
@@ -94,6 +149,11 @@ class PostgresClaudeSessionStore(SessionStore):
         return [{"session_id": row["session_id"], "mtime": int(row["mtime"])} for row in rows]
 
     async def delete(self, key: SessionKey) -> None:
+        """刪除 session 或特定 subpath。
+
+        正式環境要把資料保留政策、稽核、法遵與刪除權限一起設計，
+        不要只把這個 method 直接暴露給任意 client。
+        """
         subpath = key.get("subpath")
         if subpath:
             await self._pool.execute(
@@ -103,6 +163,7 @@ class PostgresClaudeSessionStore(SessionStore):
                 subpath,
             )
             return
+
         await self._pool.execute(
             f"DELETE FROM {self._table} WHERE project_key=$1 AND session_id=$2",
             key["project_key"],
@@ -110,6 +171,7 @@ class PostgresClaudeSessionStore(SessionStore):
         )
 
     async def list_subkeys(self, key: SessionListSubkeysKey) -> list[str]:
+        """列出 SDK 在同一 session 下使用的 subpath keys。"""
         rows = await self._pool.fetch(
             f"""
             SELECT DISTINCT subpath FROM {self._table}
