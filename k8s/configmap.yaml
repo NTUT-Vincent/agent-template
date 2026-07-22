@@ -1,3 +1,7 @@
+# 非敏感 runtime 設定。
+#
+# Secret 類資料（DATABASE_URL password、ANTHROPIC_API_KEY 等）不要放 ConfigMap。
+
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -6,8 +10,16 @@ data:
   APP_ENV: prod
   API_HOST: 0.0.0.0
   API_PORT: "8000"
+
+  # 這個值會被寫進 A2A Agent Card。
+  # 一定要改成其他 Agent 真正能連到的 Ingress/Gateway URL。
+  # 不要在 production 留 localhost 或 cluster-internal-only URL。
   A2A_PUBLIC_URL: https://agent.example.com/a2a
+
+  # Claude Agent SDK runtime configuration。
   CLAUDE_MODEL: claude-sonnet-4-5
   CLAUDE_MAX_TURNS: "8"
   CLAUDE_PROJECT_KEY: agent-runtime
+
+  # 要求 LangGraph persistence 使用較嚴格的 msgpack serialization 行為。
   LANGGRAPH_STRICT_MSGPACK: "true"
