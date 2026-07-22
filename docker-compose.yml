@@ -1,5 +1,18 @@
+# 本機開發用 docker-compose。
+#
+# 這裡刻意把 runtime 拆成四個服務，對應 production 的責任邊界：
+#
+#   postgres -> durable state
+#   redis    -> Celery delivery/backpressure
+#   api      -> FastAPI + A2A server
+#   worker   -> internal Celery background jobs
+#
+# A2A 並沒有獨立第五個 container；它跟 FastAPI 共用 api service。
+
 services:
   postgres:
+    # 本機示範直接啟一顆 PostgreSQL。
+    # Production 通常改用 managed/external PostgreSQL。
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: agent
@@ -13,10 +26,17 @@ services:
       retries: 20
 
   redis:
+    # Redis 只負責 Celery broker/result delivery。
+    # LangGraph state、A2A Task、SDK session 都不應只存在 Redis。
     image: redis:7-alpine
     ports: ["6379:6379"]
 
   api:
+    # 這個 container 同時提供：
+    #   GET  /health
+    #   GET  /.well-known/agent-card.json
+    #   POST /a2a
+    #   /internal/v1/*
     build: .
     env_file: .env
     command: uvicorn agent_runtime.api.main:app --host 0.0.0.0 --port 8000
@@ -26,9 +46,13 @@ services:
       redis: {condition: service_started}
 
   worker:
+    # 只處理 internal Celery background jobs。
+    # A2A request 預設直接進 shared AgentRuntimeService，不經這個 Celery worker。
     build: .
     env_file: .env
-    command: celery -A agent_runtime.tasks.celery_app.celery_app worker -l INFO --concurrency=2
+    command: >-
+      celery -A agent_runtime.tasks.celery_app.celery_app
+      worker -l INFO --concurrency=2
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_started}
