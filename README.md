@@ -1,147 +1,352 @@
 # Agent Runtime Platform Template
 
-A reference template for building a **Kubernetes-ready enterprise agent service** with:
+給公司內部 Agent 專案使用的 **Kubernetes-ready Agent Runtime 範本**。
 
-- LangGraph for durable workflow state
-- PostgreSQL for checkpoints, long-term memory and sessions
-- Claude Agent SDK for agent reasoning/tools
-- the official A2A Python SDK (`a2a-sdk`) for agent-to-agent interoperability
-- Celery + Redis for internal background jobs
-- FastAPI as the application/API host
+這個 repository 的重點不是示範「怎麼 call LLM」，而是提供一套可延伸的工程骨架，處理：
 
-The main design rule is simple:
+- A2A Agent-to-Agent 標準介面
+- LangGraph durable workflow / checkpoint
+- PostgreSQL persistence
+- Long-term memory
+- Agent SDK native session
+- Celery / Redis background job
+- FastAPI application API
+- Kubernetes stateless deployment
 
-> **A2A is the public agent interoperability contract. Internal REST is application-specific. Both reuse the same LangGraph + Agent SDK runtime.**
+> 核心原則：**A2A 是 Agent 對 Agent 的標準協定；Internal REST 是產品自己的 API；兩者共用同一個 LangGraph + Agent SDK runtime。**
 
-## Architecture
+---
+
+## 👋 第一次看這個 Repo？從這裡開始
+
+完整繁中教學：
+
+**[`docs/TUTORIAL.zh-TW.md`](docs/TUTORIAL.zh-TW.md)**
+
+建議閱讀順序：
 
 ```text
-                         Agent / A2A Client
-                                |
-                  GET /.well-known/agent-card.json
-                         POST /a2a (JSON-RPC)
-                                |
-                                v
-                    Official A2A Python SDK
-                   AgentExecutor / TaskStore
-                                |
-                                v
-+-------------------- FastAPI application --------------------+
-|                                                             |
-|  Public A2A                              Internal REST       |
-|  /a2a                                   /internal/v1/*      |
-|     |                                         |             |
-|     |                                         v             |
-|     |                                  PostgreSQL app_tasks |
-|     |                                         |             |
-|     |                                  Redis / Celery       |
-|     |                                         |             |
-|     +--------------------+--------------------+             |
-|                          v                                  |
-|                AgentRuntimeService                          |
-|                          |                                  |
-|                       LangGraph                             |
-|                  /                     \                    |
-|       AsyncPostgresSaver         AsyncPostgresStore         |
-|          checkpoints              long-term memory          |
-|                          |                                  |
-|                   Claude Agent SDK                          |
-|                          |                                  |
-|             PostgreSQL SessionStore                        |
-+-------------------------------------------------------------+
+1. README.md
+2. docs/TUTORIAL.zh-TW.md
+3. src/agent_runtime/api/main.py
+4. src/agent_runtime/a2a/server.py
+5. src/agent_runtime/a2a/executor.py
+6. src/agent_runtime/service.py
+7. src/agent_runtime/graph/builder.py
+8. src/agent_runtime/runtime.py
+9. src/agent_runtime/agent_sdk/claude.py
+10. src/agent_runtime/persistence/langgraph.py
+11. src/agent_runtime/persistence/claude_session_store.py
+12. src/agent_runtime/tasks/celery_app.py
+13. src/agent_runtime/tasks/jobs.py
+14. src/agent_runtime/db.py
 ```
 
-## API boundary
+上述核心檔案都加入了大量繁中註解，可以直接沿 call chain 往下讀。
 
-This distinction is intentional. Do not make every endpoint "look like A2A".
+---
 
-| Endpoint | Contract | Purpose |
+# 1. 一張圖先看懂整體架構
+
+```text
+                           Other Agent
+                               |
+                         A2A Protocol
+                               |
+              GET /.well-known/agent-card.json
+                         POST /a2a
+                               |
+                               v
+                    Official A2A Python SDK
+                    AgentExecutor / TaskStore
+                               |
+                               v
++----------------------- FastAPI -----------------------+
+|                                                       |
+|  Public A2A                        Internal REST       |
+|  /a2a                             /internal/v1/*      |
+|     |                                   |             |
+|     |                                   v             |
+|     |                             app_tasks           |
+|     |                                   |             |
+|     |                             Redis / Celery      |
+|     |                                   |             |
+|     +----------------+------------------+             |
+|                      v                                |
+|             AgentRuntimeService                       |
+|                      |                                |
+|                      v                                |
+|                  LangGraph                            |
+|              /               \                        |
+|   PostgresSaver             PostgresStore             |
+|    checkpoint              long memory                |
+|                      |                                |
+|                      v                                |
+|               agent_sdk node                         |
+|                      |                                |
+|                      v                                |
+|             Claude Agent SDK                         |
+|                      |                                |
+|          PostgresClaudeSessionStore                  |
++-------------------------------------------------------+
+```
+
+---
+
+# 2. A2A 到底在哪裡「跑起來」？
+
+整個 container 只啟動一個 Uvicorn/FastAPI server：
+
+```text
+uvicorn agent_runtime.api.main:app
+```
+
+FastAPI startup 時：
+
+```text
+src/agent_runtime/api/main.py
+  -> lifespan()
+  -> add_a2a_routes(...)
+```
+
+接著：
+
+```text
+src/agent_runtime/a2a/server.py
+  -> add_a2a_routes_to_fastapi(...)
+```
+
+因此同一個 process 同時提供：
+
+```text
+GET  /.well-known/agent-card.json
+POST /a2a
+
+GET  /health
+POST /internal/v1/sessions
+POST /internal/v1/tasks
+GET  /internal/v1/tasks/{id}
+```
+
+A2A 不需要另外開第二個 port 或第二個 server process。
+
+---
+
+# 3. A2A 到底在哪裡「接到 Agent」？
+
+最重要的 call chain：
+
+```text
+POST /a2a
+   |
+   v
+Official A2A SDK
+   |
+   v
+RuntimeA2AExecutor.execute()
+   |
+   v
+AgentRuntimeService.run_prompt()
+   |
+   v
+LangGraph.ainvoke()
+   |
+   v
+node: agent_sdk
+   |
+   v
+ClaudeAgentExecutor.run()
+   |
+   v
+claude_agent_sdk.query()
+```
+
+三個關鍵 bridge：
+
+```python
+# A2A -> Application Runtime
+RuntimeA2AExecutor(runtime.service.run_prompt)
+
+# Application Runtime -> LangGraph
+await self._graph.ainvoke(...)
+
+# LangGraph -> Agent SDK
+await agent.run(...)
+```
+
+真正進 Claude Agent SDK：
+
+```python
+async for message in query(
+    prompt=request.prompt,
+    options=options,
+):
+    ...
+```
+
+---
+
+# 4. API 邊界
+
+不要讓所有 endpoint 都假裝是 A2A。
+
+| Endpoint | Contract | 用途 |
 |---|---|---|
 | `GET /.well-known/agent-card.json` | **A2A** | Agent discovery / capabilities |
-| `POST /a2a` | **A2A 1.0 JSON-RPC** | Agent-to-agent messages, tasks, streaming, cancellation |
-| `GET /health` | Operations | Kubernetes health probe |
-| `GET /docs` | FastAPI | Development/OpenAPI documentation |
-| `POST /internal/v1/sessions` | Internal REST | Create an application conversation/thread |
-| `POST /internal/v1/tasks` | Internal REST | Submit a Celery-backed application job |
-| `GET /internal/v1/tasks/{id}` | Internal REST | Poll internal job status |
+| `POST /a2a` | **A2A 1.0 JSON-RPC** | Agent-to-Agent message/task/artifact |
+| `GET /health` | Operations | Kubernetes probe |
+| `GET /docs` | FastAPI | OpenAPI / 開發文件 |
+| `POST /internal/v1/sessions` | Internal REST | 建立產品 conversation/thread |
+| `POST /internal/v1/tasks` | Internal REST | 建立 Celery background job |
+| `GET /internal/v1/tasks/{id}` | Internal REST | 查 internal job 狀態 |
 
-The A2A routes are registered using the official SDK route helpers and are served by the same FastAPI process as the internal API.
+判斷方式：
 
-## Responsibility model
+```text
+另一個 Agent 要呼叫這個 Agent？
+    -> A2A
 
-### A2A SDK
+UI / Admin / 公司後端要操作產品功能？
+    -> /internal/v1/*
+```
 
-Owns protocol-facing concepts:
+---
+
+# 5. 各元件到底負責什麼？
+
+## A2A SDK
+
+負責 protocol-facing concepts：
 
 - Agent Card
-- Message / Task / Artifact
-- A2A task lifecycle
+- Message
+- Task
+- Artifact
 - JSON-RPC transport
-- streaming / resubscription behavior
-- cancellation protocol
+- streaming
+- cancellation
+- A2A task lifecycle
 
-A2A task state is persisted with the official `DatabaseTaskStore` in PostgreSQL (`a2a_tasks`).
+A2A Task persistence：
 
-### LangGraph
+```text
+DatabaseTaskStore -> PostgreSQL a2a_tasks
+```
 
-Owns execution/workflow state:
+---
+
+## LangGraph
+
+負責：
 
 - durable `thread_id`
+- workflow state
 - checkpoint / resume
-- workflow routing
-- human-in-the-loop boundaries
-- long-running workflow state
+- routing
+- human-in-the-loop boundary
+- deterministic orchestration
 
-`A2A contextId` is mapped to the LangGraph `thread_id`, so multiple messages/tasks in one A2A conversation can continue the same durable graph context.
+目前 graph：
 
-### Agent SDK
+```text
+START
+  -> load_memory
+  -> agent_sdk
+  -> save_memory
+  -> END
+```
 
-Owns adaptive agent execution:
+---
+
+## Agent SDK
+
+負責：
 
 - reasoning loop
-- MCP/tool usage
+- MCP / tool use
 - subagents
-- file/code operations
+- adaptive execution
+- native session transcript
 
-Native SDK transcripts are mirrored to PostgreSQL through `PostgresClaudeSessionStore`, so resuming a session does not depend on a sticky Kubernetes Pod.
+目前 implementation：
 
-### Celery / Redis
+```text
+ClaudeAgentExecutor
+```
 
-Only owns **internal job delivery and backpressure**.
+---
 
-It is not the source of truth for agent/workflow state. Internal job status is persisted in PostgreSQL; LangGraph checkpoints remain the workflow source of truth.
+## Celery / Redis
 
-A2A requests do **not** create a duplicate Celery/A2A task chain. They invoke the same protocol-neutral `AgentRuntimeService.run_prompt()` directly, while the A2A SDK owns the visible A2A Task lifecycle.
+只負責：
 
-## Persistence model
+- internal job delivery
+- backpressure
+- worker concurrency
 
-| Concern | Storage / component |
+不是 durable workflow source of truth。
+
+---
+
+# 6. Persistence 一覽
+
+| 問題 | 元件 / 儲存 |
 |---|---|
-| Application conversation mapping | `app_sessions` |
-| Internal job lifecycle | `app_tasks` |
-| A2A protocol task lifecycle | official `DatabaseTaskStore` → `a2a_tasks` |
-| Workflow checkpoints | `AsyncPostgresSaver` |
-| Cross-thread memory | `AsyncPostgresStore` |
-| Claude native transcript | `PostgresClaudeSessionStore` |
-| Queue / backpressure | Redis + Celery |
-| Business/domain data | domain DB / MCP services |
+| UI conversation 對應哪個 thread？ | `app_sessions` |
+| Internal background job 狀態？ | `app_tasks` |
+| A2A protocol Task 狀態？ | `a2a_tasks` |
+| LangGraph workflow 執行到哪？ | `AsyncPostgresSaver` |
+| 跨 thread 的 long-term memory？ | `AsyncPostgresStore` |
+| Claude SDK native transcript？ | `PostgresClaudeSessionStore` |
+| 哪個 worker 要收到 job？ | Redis + Celery |
+| 真正 business/domain data？ | Domain DB / MCP services |
 
-## Project layout
+最重要的區分：
+
+```text
+Checkpoint != Long-term Memory != SDK Session != Queue
+```
+
+---
+
+# 7. ID Mapping
+
+| ID | 層級 | 意義 |
+|---|---|---|
+| `user_id` | Application | identity / memory namespace |
+| `thread_id` | LangGraph | durable checkpoint identity |
+| `sdk_session_id` | Agent SDK | native session resume |
+| `A2A contextId` | A2A | Agent conversation context |
+| `A2A taskId` | A2A | protocol task |
+| `app_tasks.id` | Internal | background job |
+| `celery_job_id` | Queue | delivery tracking |
+
+推薦：
+
+```text
+A2A contextId -> LangGraph thread_id
+```
+
+不要把 `taskId`、`thread_id`、`sdk_session_id` 全部強迫設成同一個 ID。
+
+---
+
+# 8. Project Layout
 
 ```text
 src/agent_runtime/
 ├── a2a/
-│   ├── executor.py       # official AgentExecutor -> shared runtime
-│   └── server.py         # Agent Card + /a2a official routes
+│   ├── executor.py       # A2A Message -> shared runtime
+│   └── server.py         # Agent Card + official A2A routes
 ├── agent_sdk/
-│   ├── base.py
-│   ├── claude.py
+│   ├── base.py           # Agent abstraction
+│   ├── claude.py         # Claude Agent SDK adapter
 │   └── mock.py
 ├── api/
-│   ├── main.py           # FastAPI host + internal REST
+│   ├── main.py           # FastAPI host + A2A wiring + internal REST
 │   └── schemas.py
 ├── graph/
-│   ├── builder.py
+│   ├── builder.py        # LangGraph topology
 │   └── state.py
 ├── persistence/
 │   ├── claude_session_store.py
@@ -149,22 +354,38 @@ src/agent_runtime/
 ├── tasks/
 │   ├── celery_app.py
 │   └── jobs.py
+├── config.py
 ├── db.py
-├── runtime.py
+├── runtime.py            # dependency composition root
 └── service.py            # protocol-neutral execution boundary
 ```
 
-## Run locally
+---
 
-Requirements: Docker and an Anthropic API key.
+# 9. 本機啟動
+
+需求：
+
+- Docker
+- Anthropic API key
 
 ```bash
 cp .env.example .env
-# set ANTHROPIC_API_KEY
+```
+
+設定：
+
+```env
+ANTHROPIC_API_KEY=...
+```
+
+啟動：
+
+```bash
 docker compose up --build
 ```
 
-Useful endpoints:
+確認：
 
 ```text
 http://localhost:8000/docs
@@ -173,17 +394,19 @@ http://localhost:8000/.well-known/agent-card.json
 http://localhost:8000/a2a
 ```
 
-`A2A_PUBLIC_URL` must point to the externally reachable JSON-RPC endpoint advertised in the Agent Card:
+`A2A_PUBLIC_URL` 是 Agent Card 對其他 Agent 宣告的實際 endpoint：
 
 ```env
 A2A_PUBLIC_URL=http://localhost:8000/a2a
 ```
 
-For an A2A integration test, prefer an official A2A client SDK that first reads the Agent Card and then sends messages through the advertised interface rather than building custom `/agent/...` HTTP calls.
+Kubernetes deployment 時必須改成 ingress/gateway 真正可達的 URL。
 
-### Internal REST example
+---
 
-Create a UI/application session:
+# 10. Internal REST Demo
+
+建立 session：
 
 ```bash
 curl -s http://localhost:8000/internal/v1/sessions \
@@ -191,7 +414,7 @@ curl -s http://localhost:8000/internal/v1/sessions \
   -d '{"user_id":"demo-user"}'
 ```
 
-Submit a background job with the returned `thread_id`:
+取得 `thread_id` 後建立 background job：
 
 ```bash
 curl -s http://localhost:8000/internal/v1/tasks \
@@ -204,45 +427,121 @@ curl -s http://localhost:8000/internal/v1/tasks \
   }'
 ```
 
-## How to extend this template
+---
 
-When adding a new capability, keep these boundaries:
-
-1. **Another agent needs to call it** → expose/update an A2A `AgentSkill` and keep implementation behind `AgentExecutor`.
-2. **The agent needs a tool** → expose the capability through MCP/tool integration, not A2A.
-3. **It is an internal deterministic workflow step** → add a LangGraph node/service, not a separate A2A agent.
-4. **UI/admin needs application-specific operations** → add under `/internal/v1/...`, not to the A2A protocol surface.
-5. **The operation has side effects** → make the tool idempotent and auditable; checkpointing alone does not guarantee exactly-once execution.
-
-Avoid architectures like:
+# 11. 要新增功能時放哪裡？
 
 ```text
-Agent A -> custom POST /agent-b -> Agent B
+Agent <-> Agent
+    -> A2A
+
+Agent -> Tool / Data / Service
+    -> MCP / Tool
+
+Deterministic workflow step
+    -> LangGraph node / service
+
+UI / Admin operation
+    -> /internal/v1/*
+
+Background job
+    -> Celery
+
+Durable workflow state
+    -> PostgresSaver
+
+Cross-thread memory
+    -> PostgresStore
 ```
 
-and calling that "A2A". A standard A2A boundary should expose Agent Card discovery and the protocol Task/Message/Artifact lifecycle through the official SDK.
+## 不要這樣做
 
-## Production hardening backlog
+```text
+Agent A
+  -> custom POST /agent-b
+  -> Agent B
+```
 
-This repository is a reference template, not a finished enterprise platform. Before production use:
+然後就稱它是 A2A。
 
-- replace startup `create_all()` / SDK `setup()` with managed migrations
-- add authentication and map authenticated identity/tenant into A2A `ServerCallContext`
-- add authorization/tenant scoping to sessions, memory namespaces and task stores
-- add per-thread distributed locking when concurrent mutation is possible
-- use an outbox pattern for internal DB-job enqueue consistency
-- add idempotency keys around side-effecting MCP/tool calls
-- add deadlines/timeouts and cooperative cancellation to downstream tools
-- add OpenTelemetry traces, structured logs and audit records
-- define a deliberate long-term-memory extraction policy instead of remembering every message
-- encrypt or strictly restrict checkpoint/session data
+也不要：
 
-## Kubernetes
+```text
+LangChain Agent
+  -> LangGraph Agent
+  -> Agent SDK Agent
+```
 
-`k8s/` contains API and worker Deployment examples. PostgreSQL and Redis should normally be managed/external services in production.
+同時堆很多層 autonomous loop。
 
-API Pods are horizontally replaceable: A2A task state, LangGraph checkpoints, long-term memory and Agent SDK session data are persisted outside the Pod.
+推薦只有一個主要 reasoning runtime，LangGraph 負責外層 orchestration。
 
-## Versions
+---
 
-Scaffolded in July 2026 against the then-current major lines: LangGraph 1.2.x, `langgraph-checkpoint-postgres` 3.1.x, Claude Agent SDK 0.2.x and official A2A Python SDK 1.1.x.
+# 12. Production 前必補
+
+此 repo 是 **reference template**，不是完成的 production platform。
+
+至少需要補：
+
+- authentication / authorization
+- A2A caller identity / tenant mapping
+- DB migrations
+- per-thread concurrency control / distributed lock
+- outbox pattern
+- idempotent side-effect tools
+- deadline / timeout / cooperative cancellation
+- OpenTelemetry
+- structured logs
+- audit records
+- memory extraction / retention policy
+- secret management
+- data encryption / access control
+
+特別注意：
+
+> checkpoint / queue retry 不等於 exactly-once。
+
+任何有副作用的 tool 都應自己實作 idempotency。
+
+---
+
+# 13. 進一步教學
+
+完整逐步 request flow、Pod crash 恢復、ID mapping、擴充 MCP/A2A/Human Approval 的說明：
+
+👉 **[`docs/TUTORIAL.zh-TW.md`](docs/TUTORIAL.zh-TW.md)**
+
+核心 Python 檔案內也已加入大量繁中註解，建議搭配教學文件逐層閱讀。
+
+---
+
+# 14. Kubernetes
+
+`k8s/` 提供 API / Worker Deployment 範例。
+
+Production 建議 PostgreSQL、Redis 使用 managed/external service。
+
+API / Worker Pod 本身盡量 stateless；重要 state 都存到 Pod 外：
+
+```text
+A2A Task        -> PostgreSQL
+LangGraph state -> PostgreSQL
+Long memory     -> PostgreSQL
+SDK session     -> PostgreSQL
+Internal task   -> PostgreSQL
+Queue delivery  -> Redis
+```
+
+因此 Pod restart/reschedule 不需要 sticky Pod 才能保留核心狀態。
+
+---
+
+# 15. Versions
+
+Scaffolded in July 2026 against the then-current major lines:
+
+- LangGraph 1.2.x
+- `langgraph-checkpoint-postgres` 3.1.x
+- Claude Agent SDK 0.2.x
+- official A2A Python SDK 1.1.x
