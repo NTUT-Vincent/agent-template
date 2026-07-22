@@ -2,65 +2,60 @@
 
 給公司內部 Agent 專案使用的 **Kubernetes-ready Agent Runtime 範本**。
 
-這個 repository 的重點不是示範「怎麼 call LLM」，而是提供一套可延伸的工程骨架，處理：
+這個 repository 的目標不是只示範「怎麼 call LLM」，而是提供一套可以延伸成正式 Agent 平台的工程骨架：
 
 - A2A Agent-to-Agent 標準介面
 - LangGraph durable workflow / checkpoint
-- PostgreSQL persistence
-- Long-term memory
-- Agent SDK native session
+- PostgreSQL long-term memory
+- Claude Agent SDK reasoning / MCP / subagents
+- Claude Agent SDK 官方 SessionStore 跨 Pod session recovery
 - Celery / Redis background job
 - FastAPI application API
 - Kubernetes stateless deployment
 
-> 核心原則：**A2A 是 Agent 對 Agent 的標準協定；Internal REST 是產品自己的 API；兩者共用同一個 LangGraph + Agent SDK runtime。**
+> 核心原則：**A2A 是 Agent 對 Agent 的標準協定；Internal REST 是產品自己的 API；LangGraph 管 workflow；Claude Agent SDK 管 agent loop；SessionStore 管 Claude native transcript。**
 
 ---
 
-## 👋 第一次看這個 Repo？從這裡開始
+## 第一次看這個 Repo？
 
-完整繁中教學：
+建議依序閱讀：
 
-**[`docs/TUTORIAL.zh-TW.md`](docs/TUTORIAL.zh-TW.md)**
+1. 本 README：先建立整體心智模型
+2. [`docs/TUTORIAL.zh-TW.md`](docs/TUTORIAL.zh-TW.md)：完整 runtime / A2A / LangGraph 教學
+3. [`docs/CLAUDE_SESSION_STORE.zh-TW.md`](docs/CLAUDE_SESSION_STORE.zh-TW.md)：Claude SessionStore 與跨 Pod recovery 專題
+4. `src/agent_runtime/api/main.py`
+5. `src/agent_runtime/a2a/server.py`
+6. `src/agent_runtime/a2a/executor.py`
+7. `src/agent_runtime/service.py`
+8. `src/agent_runtime/graph/builder.py`
+9. `src/agent_runtime/runtime.py`
+10. `src/agent_runtime/agent_sdk/claude.py`
+11. `src/agent_runtime/persistence/claude_session_store.py`
+12. `src/agent_runtime/persistence/langgraph.py`
+13. `src/agent_runtime/tasks/*`
+14. `src/agent_runtime/db.py`
 
-建議閱讀順序：
-
-```text
-1. README.md
-2. docs/TUTORIAL.zh-TW.md
-3. src/agent_runtime/api/main.py
-4. src/agent_runtime/a2a/server.py
-5. src/agent_runtime/a2a/executor.py
-6. src/agent_runtime/service.py
-7. src/agent_runtime/graph/builder.py
-8. src/agent_runtime/runtime.py
-9. src/agent_runtime/agent_sdk/claude.py
-10. src/agent_runtime/persistence/langgraph.py
-11. src/agent_runtime/persistence/claude_session_store.py
-12. src/agent_runtime/tasks/celery_app.py
-13. src/agent_runtime/tasks/jobs.py
-14. src/agent_runtime/db.py
-```
-
-上述核心檔案都加入了大量繁中註解，可以直接沿 call chain 往下讀。
+核心 Python 檔案都有繁中教學註解，可以直接沿 call chain 往下讀。
 
 ---
 
 # 1. 一張圖先看懂整體架構
 
 ```text
-                           Other Agent
-                               |
-                         A2A Protocol
-                               |
-              GET /.well-known/agent-card.json
-                         POST /a2a
-                               |
-                               v
-                    Official A2A Python SDK
-                    AgentExecutor / TaskStore
-                               |
-                               v
+                            Other Agent
+                                |
+                          A2A Protocol
+                                |
+               GET /.well-known/agent-card.json
+                          POST /a2a
+                                |
+                                v
+                     Official A2A Python SDK
+                                |
+                        RuntimeA2AExecutor
+                                |
+                                v
 +----------------------- FastAPI -----------------------+
 |                                                       |
 |  Public A2A                        Internal REST       |
@@ -85,35 +80,49 @@
 |               agent_sdk node                         |
 |                      |                                |
 |                      v                                |
-|             Claude Agent SDK                         |
+|             ClaudeAgentExecutor                       |
 |                      |                                |
-|          PostgresClaudeSessionStore                  |
+|         +------------+-------------+                  |
+|         |                          |                  |
+|         v                          v                  |
+|  Claude Agent SDK        PostgresClaudeSessionStore   |
+|  reasoning/MCP              native transcript         |
 +-------------------------------------------------------+
 ```
 
+另外還有一個很重要的 application mapping：
+
+```text
+app_sessions
+thread_id <-> sdk_session_id
+```
+
+它讓下一顆 Pod 知道同一條 LangGraph thread 要 resume 哪一份 Claude native session。
+
 ---
 
-# 2. A2A 到底在哪裡「跑起來」？
+# 2. A2A 在哪裡跑起來？
 
-整個 container 只啟動一個 Uvicorn/FastAPI server：
+整個 API container 只啟動一個 Uvicorn/FastAPI process：
 
 ```text
 uvicorn agent_runtime.api.main:app
 ```
 
-FastAPI startup 時：
+FastAPI startup：
 
 ```text
 src/agent_runtime/api/main.py
   -> lifespan()
+  -> RuntimeContainer.start()
+  -> RuntimeA2AExecutor(runtime.service.run_prompt)
   -> add_a2a_routes(...)
 ```
 
-接著：
+`a2a/server.py` 再使用官方 SDK：
 
 ```text
-src/agent_runtime/a2a/server.py
-  -> add_a2a_routes_to_fastapi(...)
+add_a2a_routes_to_fastapi(...)
 ```
 
 因此同一個 process 同時提供：
@@ -128,112 +137,96 @@ POST /internal/v1/tasks
 GET  /internal/v1/tasks/{id}
 ```
 
-A2A 不需要另外開第二個 port 或第二個 server process。
+A2A 不需要另一個 port 或另一個 server process。
 
 ---
 
-# 3. A2A 到底在哪裡「接到 Agent」？
+# 3. A2A 在哪裡接到真正 Agent？
 
-最重要的 call chain：
+完整 call chain：
 
 ```text
 POST /a2a
-   |
-   v
-Official A2A SDK
-   |
-   v
-RuntimeA2AExecutor.execute()
-   |
-   v
-AgentRuntimeService.run_prompt()
-   |
-   v
-LangGraph.ainvoke()
-   |
-   v
-node: agent_sdk
-   |
-   v
-ClaudeAgentExecutor.run()
-   |
-   v
-claude_agent_sdk.query()
+   -> Official A2A SDK
+   -> RuntimeA2AExecutor.execute()
+   -> AgentRuntimeService.run_prompt()
+   -> LangGraph.ainvoke()
+   -> graph node: agent_sdk
+   -> ClaudeAgentExecutor.run()
+   -> claude_agent_sdk.query()
 ```
 
-三個關鍵 bridge：
+三個主要 bridge：
 
 ```python
-# A2A -> Application Runtime
+# A2A -> Application runtime
 RuntimeA2AExecutor(runtime.service.run_prompt)
 
-# Application Runtime -> LangGraph
+# Application runtime -> LangGraph
 await self._graph.ainvoke(...)
 
 # LangGraph -> Agent SDK
 await agent.run(...)
 ```
 
-真正進 Claude Agent SDK：
-
-```python
-async for message in query(
-    prompt=request.prompt,
-    options=options,
-):
-    ...
-```
+A2A 只是 interoperability protocol；真正 autonomous reasoning / MCP / subagent execution 發生在 Claude Agent SDK。
 
 ---
 
 # 4. API 邊界
 
-不要讓所有 endpoint 都假裝是 A2A。
-
 | Endpoint | Contract | 用途 |
 |---|---|---|
-| `GET /.well-known/agent-card.json` | **A2A** | Agent discovery / capabilities |
-| `POST /a2a` | **A2A 1.0 JSON-RPC** | Agent-to-Agent message/task/artifact |
+| `GET /.well-known/agent-card.json` | A2A | Agent discovery / capabilities |
+| `POST /a2a` | A2A JSON-RPC | Agent-to-Agent message/task/artifact |
 | `GET /health` | Operations | Kubernetes probe |
 | `GET /docs` | FastAPI | OpenAPI / 開發文件 |
 | `POST /internal/v1/sessions` | Internal REST | 建立產品 conversation/thread |
 | `POST /internal/v1/tasks` | Internal REST | 建立 Celery background job |
 | `GET /internal/v1/tasks/{id}` | Internal REST | 查 internal job 狀態 |
 
-判斷方式：
+原則：
 
 ```text
-另一個 Agent 要呼叫這個 Agent？
-    -> A2A
+Agent -> Agent
+    => A2A
 
-UI / Admin / 公司後端要操作產品功能？
-    -> /internal/v1/*
+UI / Admin / 公司服務 -> application operation
+    => /internal/v1/*
+
+Agent -> Tool / DB / Domain service
+    => MCP / Tool API
 ```
+
+不要把所有 HTTP endpoint 都包裝成 A2A。
 
 ---
 
-# 5. 各元件到底負責什麼？
+# 5. 各層責任
 
 ## A2A SDK
 
-負責 protocol-facing concepts：
+負責：
 
 - Agent Card
-- Message
-- Task
-- Artifact
+- Message / Task / Artifact
+- protocol task lifecycle
 - JSON-RPC transport
-- streaming
-- cancellation
-- A2A task lifecycle
+- streaming / cancellation
 
-A2A Task persistence：
+A2A task state 使用官方 `DatabaseTaskStore` 寫 PostgreSQL `a2a_tasks`。
+
+## AgentRuntimeService
+
+所有入口的 protocol-neutral execution boundary：
 
 ```text
-DatabaseTaskStore -> PostgreSQL a2a_tasks
+A2A -------------------+
+                       |
+Internal REST/Celery --+--> AgentRuntimeService.run_prompt()
 ```
 
----
+它負責 application session mapping、把 request 送進 LangGraph，以及 early Claude session identity persistence。
 
 ## LangGraph
 
@@ -242,9 +235,9 @@ DatabaseTaskStore -> PostgreSQL a2a_tasks
 - durable `thread_id`
 - workflow state
 - checkpoint / resume
-- routing
+- deterministic routing
 - human-in-the-loop boundary
-- deterministic orchestration
+- long-term memory retrieval / write policy
 
 目前 graph：
 
@@ -256,9 +249,7 @@ START
   -> END
 ```
 
----
-
-## Agent SDK
+## Claude Agent SDK
 
 負責：
 
@@ -268,54 +259,142 @@ START
 - adaptive execution
 - native session transcript
 
-目前 implementation：
-
-```text
-ClaudeAgentExecutor
-```
-
----
-
 ## Celery / Redis
 
-只負責：
+只負責 internal background job delivery、backpressure、worker concurrency。
 
-- internal job delivery
-- backpressure
-- worker concurrency
-
-不是 durable workflow source of truth。
+Redis **不是** workflow source of truth。
 
 ---
 
 # 6. Persistence 一覽
 
-| 問題 | 元件 / 儲存 |
+| 問題 | Owner / Storage |
 |---|---|
-| UI conversation 對應哪個 thread？ | `app_sessions` |
-| Internal background job 狀態？ | `app_tasks` |
-| A2A protocol Task 狀態？ | `a2a_tasks` |
+| Application conversation 對應哪個 SDK session？ | `app_sessions` |
+| Internal job lifecycle？ | `app_tasks` |
+| A2A protocol Task lifecycle？ | `a2a_tasks` |
 | LangGraph workflow 執行到哪？ | `AsyncPostgresSaver` |
-| 跨 thread 的 long-term memory？ | `AsyncPostgresStore` |
-| Claude SDK native transcript？ | `PostgresClaudeSessionStore` |
-| 哪個 worker 要收到 job？ | Redis + Celery |
-| 真正 business/domain data？ | Domain DB / MCP services |
+| 跨 thread long-term memory？ | `AsyncPostgresStore` |
+| Claude SDK native transcript / subagents？ | `PostgresClaudeSessionStore` |
+| Queue delivery / backpressure？ | Redis + Celery |
+| Business/domain data？ | Domain DB / MCP services |
 
-最重要的區分：
+請記住：
 
 ```text
-Checkpoint != Long-term Memory != SDK Session != Queue
+Checkpoint
+!= Long-term Memory
+!= Claude Session transcript
+!= A2A Task
+!= Celery Job
 ```
 
 ---
 
-# 7. ID Mapping
+# 7. Claude SessionStore：跨 Pod recovery
+
+Claude Agent SDK 的 native transcript 不能只依賴 Pod local filesystem。
+
+本範本使用官方 SessionStore contract：
+
+```text
+Claude SDK local JSONL
+        |
+        | SessionStore.append()
+        v
+PostgresClaudeSessionStore
+        |
+        v
+PostgreSQL
+```
+
+SessionStore 是 **mirror**，不是 transaction log。`session_store_flush="eager"` 用來縮短 external mirror 落後 local transcript 的窗口，但不能提供 exactly-once。
+
+## 第一輪
+
+```text
+thread_id = thread-001
+sdk_session_id = NULL
+
+Claude query()
+   -> SystemMessage(subtype="init")
+   -> data["session_id"] = sdk-abc
+   -> 立即 COMMIT app_sessions
+   -> SessionStore eager mirror
+   -> Agent 繼續執行
+```
+
+我們**不再只等 ResultMessage** 才保存 `sdk_session_id`。
+
+這是為了縮小以下 crash window：
+
+```text
+transcript 已 mirror
+Pod crash
+但 app_sessions 還不知道 session id
+```
+
+## 下一顆 Pod
+
+```text
+thread_id
+   -> app_sessions.sdk_session_id
+   -> ClaudeAgentOptions(resume=sdk_session_id)
+   -> SessionStore.load()
+   -> PostgreSQL transcript
+   -> restore Claude native session
+```
+
+專題文件：[`docs/CLAUDE_SESSION_STORE.zh-TW.md`](docs/CLAUDE_SESSION_STORE.zh-TW.md)。
+
+---
+
+# 8. SessionStore adapter 的可靠性規則
+
+`PostgresClaudeSessionStore` 目前實作：
+
+- `append()`
+- `load()`
+- `list_sessions()`
+- `list_subkeys()`
+- `delete()`
+- `list_session_summaries()`
+- `fold_session_summary()` sidecar
+
+Transcript row 包含：
+
+```text
+project_key
+session_id
+subpath
+seq
+entry_uuid
+entry JSONB
+mtime
+```
+
+因為 SessionStore mirror retry 可能重送相同 batch，所以用 `entry.uuid` 做 dedupe：
+
+```text
+UNIQUE(project_key, session_id, subpath, entry_uuid)
+```
+
+同一 session/subpath append 使用 PostgreSQL advisory transaction lock，保護 append order 與 summary fold。
+
+Subagent transcript 使用 `subpath` 保存，SDK 可透過 `list_subkeys()` 還原。
+
+如果 external mirror 最終失敗，Agent SDK 可能繼續執行並 emit `mirror_error`；`ClaudeAgentExecutor` 會記錄 error 與 `mirror_error_count`。Production 應把它接到 OTel / metrics / alert。
+
+---
+
+# 9. ID Mapping
 
 | ID | 層級 | 意義 |
 |---|---|---|
 | `user_id` | Application | identity / memory namespace |
-| `thread_id` | LangGraph | durable checkpoint identity |
-| `sdk_session_id` | Agent SDK | native session resume |
+| `thread_id` | LangGraph | durable workflow/checkpoint identity |
+| `sdk_session_id` | Claude Agent SDK | native session resume identity |
 | `A2A contextId` | A2A | Agent conversation context |
 | `A2A taskId` | A2A | protocol task |
 | `app_tasks.id` | Internal | background job |
@@ -327,61 +406,106 @@ Checkpoint != Long-term Memory != SDK Session != Queue
 A2A contextId -> LangGraph thread_id
 ```
 
-不要把 `taskId`、`thread_id`、`sdk_session_id` 全部強迫設成同一個 ID。
-
----
-
-# 8. Project Layout
+並另外保存：
 
 ```text
-src/agent_runtime/
-├── a2a/
-│   ├── executor.py       # A2A Message -> shared runtime
-│   └── server.py         # Agent Card + official A2A routes
-├── agent_sdk/
-│   ├── base.py           # Agent abstraction
-│   ├── claude.py         # Claude Agent SDK adapter
-│   └── mock.py
-├── api/
-│   ├── main.py           # FastAPI host + A2A wiring + internal REST
-│   └── schemas.py
-├── graph/
-│   ├── builder.py        # LangGraph topology
-│   └── state.py
-├── persistence/
-│   ├── claude_session_store.py
-│   └── langgraph.py
-├── tasks/
-│   ├── celery_app.py
-│   └── jobs.py
-├── config.py
-├── db.py
-├── runtime.py            # dependency composition root
-└── service.py            # protocol-neutral execution boundary
+LangGraph thread_id <-> Claude sdk_session_id
 ```
+
+不要把 `taskId`、`thread_id`、`sdk_session_id` 強迫設成同一個 ID。
 
 ---
 
-# 9. 本機啟動
+# 10. Memory 與 Session 不要同步成同一份資料
 
-需求：
+```text
+LangGraph PostgresStore
+    -> long-term facts / preferences / decisions
 
-- Docker
-- Anthropic API key
+Claude SessionStore
+    -> native conversation / tool transcript
+
+LangGraph PostgresSaver
+    -> workflow checkpoint
+```
+
+執行時是：
+
+```text
+PostgresStore
+  -> retrieve relevant memory
+  -> memory_context
+  -> Claude Agent SDK
+```
+
+Agent 結果再經過 memory extraction / policy 寫回 PostgresStore。
+
+不要把完整 Claude transcript 又複製一份到 long-term memory；也不要把 LangGraph checkpoint 當 chat history。
+
+---
+
+# 11. Pod crash 後哪些資料會留下？
+
+```text
+A2A task state        -> PostgreSQL
+app_sessions mapping  -> PostgreSQL
+LangGraph checkpoint  -> PostgreSQL
+LangGraph memory      -> PostgreSQL
+Claude transcript     -> PostgreSQL SessionStore mirror
+Internal job status   -> PostgreSQL
+Queue delivery        -> Redis / Celery
+```
+
+API/Worker Pod 本身應視為 replaceable executor。
+
+但 durability 不等於 exactly-once：
+
+```text
+Agent -> side-effect tool success -> Pod crash -> retry -> tool 可能再執行
+```
+
+因此 side-effect tool 必須有：
+
+- idempotency key
+- unique constraint / upsert
+- execution record
+- transaction / outbox
+- compensation strategy
+
+---
+
+# 12. CI / Validation
+
+CI 會：
+
+```text
+ruff check
+pytest
+```
+
+並啟動 PostgreSQL service，執行 Claude Agent SDK 官方 SessionStore conformance suite：
+
+```python
+from claude_agent_sdk.testing import run_session_store_conformance
+```
+
+測試檔：
+
+```text
+tests/test_claude_session_store_conformance.py
+```
+
+這比只寫幾個自訂 unit tests 更能確認 adapter 是否符合 SDK contract。
+
+---
+
+# 13. 本機啟動
+
+需求：Docker + Anthropic API key。
 
 ```bash
 cp .env.example .env
-```
-
-設定：
-
-```env
-ANTHROPIC_API_KEY=...
-```
-
-啟動：
-
-```bash
+# 設定 ANTHROPIC_API_KEY
 docker compose up --build
 ```
 
@@ -394,154 +518,121 @@ http://localhost:8000/.well-known/agent-card.json
 http://localhost:8000/a2a
 ```
 
-`A2A_PUBLIC_URL` 是 Agent Card 對其他 Agent 宣告的實際 endpoint：
+`A2A_PUBLIC_URL` 必須是其他 Agent 真正能連到的 endpoint：
 
 ```env
 A2A_PUBLIC_URL=http://localhost:8000/a2a
 ```
 
-Kubernetes deployment 時必須改成 ingress/gateway 真正可達的 URL。
+Kubernetes 時改成實際 ingress/gateway URL。
 
 ---
 
-# 10. Internal REST Demo
-
-建立 session：
-
-```bash
-curl -s http://localhost:8000/internal/v1/sessions \
-  -H 'content-type: application/json' \
-  -d '{"user_id":"demo-user"}'
-```
-
-取得 `thread_id` 後建立 background job：
-
-```bash
-curl -s http://localhost:8000/internal/v1/tasks \
-  -H 'content-type: application/json' \
-  -d '{
-    "user_id":"demo-user",
-    "thread_id":"THREAD_ID",
-    "prompt":"Analyze this incident.",
-    "remember":true
-  }'
-```
-
----
-
-# 11. 要新增功能時放哪裡？
+# 14. Project Layout
 
 ```text
-Agent <-> Agent
-    -> A2A
+src/agent_runtime/
+├── a2a/
+│   ├── executor.py
+│   └── server.py
+├── agent_sdk/
+│   ├── base.py
+│   ├── claude.py
+│   └── mock.py
+├── api/
+│   ├── main.py
+│   └── schemas.py
+├── graph/
+│   ├── builder.py
+│   └── state.py
+├── persistence/
+│   ├── claude_session_store.py
+│   └── langgraph.py
+├── tasks/
+│   ├── celery_app.py
+│   └── jobs.py
+├── config.py
+├── db.py
+├── runtime.py
+└── service.py
 
-Agent -> Tool / Data / Service
+docs/
+├── TUTORIAL.zh-TW.md
+└── CLAUDE_SESSION_STORE.zh-TW.md
+```
+
+---
+
+# 15. 新增功能時放哪裡？
+
+```text
+另一個 Agent 要呼叫
+    -> A2A AgentSkill + AgentExecutor boundary
+
+Agent 要查資料 / 操作 service
     -> MCP / Tool
 
-Deterministic workflow step
-    -> LangGraph node / service
+固定企業流程
+    -> LangGraph node / application service
 
 UI / Admin operation
     -> /internal/v1/*
 
-Background job
-    -> Celery
-
-Durable workflow state
-    -> PostgresSaver
-
-Cross-thread memory
-    -> PostgresStore
+side effect
+    -> idempotency + audit + policy
 ```
 
-## 不要這樣做
-
-```text
-Agent A
-  -> custom POST /agent-b
-  -> Agent B
-```
-
-然後就稱它是 A2A。
-
-也不要：
-
-```text
-LangChain Agent
-  -> LangGraph Agent
-  -> Agent SDK Agent
-```
-
-同時堆很多層 autonomous loop。
-
-推薦只有一個主要 reasoning runtime，LangGraph 負責外層 orchestration。
+LangChain 不需要成為 core runtime；有需要特定 loader/retriever/integration 時再局部使用 ecosystem package。
 
 ---
 
-# 12. Production 前必補
+# 16. Production 前仍需補強
 
-此 repo 是 **reference template**，不是完成的 production platform。
+這是 reference template，不是完成品。正式上線至少還需要：
 
-至少需要補：
-
-- authentication / authorization
-- A2A caller identity / tenant mapping
-- DB migrations
-- per-thread concurrency control / distributed lock
+- managed DB migrations，取代 startup DDL/setup
+- authentication / tenant mapping / RBAC
+- per-thread concurrency control
 - outbox pattern
-- idempotent side-effect tools
+- tool idempotency
 - deadline / timeout / cooperative cancellation
-- OpenTelemetry
-- structured logs
-- audit records
-- memory extraction / retention policy
-- secret management
-- data encryption / access control
-
-特別注意：
-
-> checkpoint / queue retry 不等於 exactly-once。
-
-任何有副作用的 tool 都應自己實作 idempotency。
+- OTel / structured logs / metrics / audit
+- SessionStore `mirror_error` alert
+- checkpoint / transcript encryption 與資料保留政策
+- memory extraction / ranking / token budget
+- streaming reconnect/resubscription strategy
 
 ---
 
-# 13. 進一步教學
-
-完整逐步 request flow、Pod crash 恢復、ID mapping、擴充 MCP/A2A/Human Approval 的說明：
-
-👉 **[`docs/TUTORIAL.zh-TW.md`](docs/TUTORIAL.zh-TW.md)**
-
-核心 Python 檔案內也已加入大量繁中註解，建議搭配教學文件逐層閱讀。
-
----
-
-# 14. Kubernetes
-
-`k8s/` 提供 API / Worker Deployment 範例。
-
-Production 建議 PostgreSQL、Redis 使用 managed/external service。
-
-API / Worker Pod 本身盡量 stateless；重要 state 都存到 Pod 外：
+# 17. 最終心智模型
 
 ```text
-A2A Task        -> PostgreSQL
-LangGraph state -> PostgreSQL
-Long memory     -> PostgreSQL
-SDK session     -> PostgreSQL
-Internal task   -> PostgreSQL
-Queue delivery  -> Redis
+A2A / Internal REST
+        |
+        v
+AgentRuntimeService
+        |
+        v
+LangGraph -------------------- PostgresSaver
+   |                           workflow checkpoint
+   |
+   +-------------------------- PostgresStore
+   |                           long-term memory
+   |
+   v
+ClaudeAgentExecutor
+        |
+        +-------------------- PostgresClaudeSessionStore
+        |                      native transcript / subagents
+        |
+        v
+Claude Agent SDK
+        |
+        v
+MCP / Tools / Subagents
+
+app_sessions:
+LangGraph thread_id <-> Claude sdk_session_id
 ```
 
-因此 Pod restart/reschedule 不需要 sticky Pod 才能保留核心狀態。
-
----
-
-# 15. Versions
-
-Scaffolded in July 2026 against the then-current major lines:
-
-- LangGraph 1.2.x
-- `langgraph-checkpoint-postgres` 3.1.x
-- Claude Agent SDK 0.2.x
-- official A2A Python SDK 1.1.x
+**Pod 是執行者，不是 state owner。**
