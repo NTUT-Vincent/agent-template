@@ -6,6 +6,8 @@ from uuid import UUID, uuid4
 from fastapi import FastAPI, HTTPException, Request
 from sqlalchemy import select
 
+from agent_runtime.a2a.executor import RuntimeA2AExecutor
+from agent_runtime.a2a.server import add_a2a_routes
 from agent_runtime.api.schemas import (
     CreateSessionRequest,
     CreateTaskRequest,
@@ -13,30 +15,68 @@ from agent_runtime.api.schemas import (
     TaskResponse,
 )
 from agent_runtime.config import get_settings
-from agent_runtime.db import SessionRow, TaskRow, create_app_schema, create_engine, create_session_factory
+from agent_runtime.db import SessionRow, TaskRow
+from agent_runtime.runtime import RuntimeContainer
 from agent_runtime.tasks.celery_app import celery_app
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
-    engine = create_engine(settings)
-    await create_app_schema(engine)
-    app.state.engine = engine
-    app.state.session_factory = create_session_factory(engine)
+    runtime = RuntimeContainer(settings)
+    await runtime.start()
+
+    if runtime.engine is None or runtime.session_factory is None or runtime.service is None:
+        raise RuntimeError("runtime failed to initialize")
+
+    app.state.runtime = runtime
+    app.state.session_factory = runtime.session_factory
+
+    # A2A is a public interoperability surface. Register it on the same FastAPI
+    # application so Agent Card + JSON-RPC are actually exposed by the container.
+    if not getattr(app.state, "a2a_registered", False):
+        executor = RuntimeA2AExecutor(runtime.service.run_prompt)
+        await add_a2a_routes(
+            app,
+            executor=executor,
+            public_url=settings.a2a_public_url,
+            engine=runtime.engine,
+        )
+        app.state.a2a_registered = True
+
     yield
-    await engine.dispose()
+    await runtime.stop()
 
 
-app = FastAPI(title="Agent Runtime Platform", version="0.1.0", lifespan=lifespan)
+app = FastAPI(
+    title="Agent Runtime Platform",
+    version="0.1.0",
+    description=(
+        "Reference template: official A2A endpoints for agent-to-agent interoperability "
+        "and /internal/v1 REST endpoints for application-specific operations."
+    ),
+    lifespan=lifespan,
+)
 
 
-@app.get("/health")
+@app.get("/health", tags=["operations"])
 async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/v1/sessions", response_model=SessionResponse, status_code=201)
+# ---------------------------------------------------------------------------
+# Internal application API
+# These endpoints are intentionally NOT A2A. They are for UI/admin/application
+# integration and use Celery as the delivery queue.
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/internal/v1/sessions",
+    response_model=SessionResponse,
+    status_code=201,
+    tags=["internal"],
+)
 async def create_session(body: CreateSessionRequest, request: Request) -> SessionResponse:
     row = SessionRow(user_id=body.user_id, thread_id=str(uuid4()))
     async with request.app.state.session_factory() as db:
@@ -51,12 +91,20 @@ async def create_session(body: CreateSessionRequest, request: Request) -> Sessio
     )
 
 
-@app.post("/v1/tasks", response_model=TaskResponse, status_code=202)
+@app.post(
+    "/internal/v1/tasks",
+    response_model=TaskResponse,
+    status_code=202,
+    tags=["internal"],
+)
 async def create_task(body: CreateTaskRequest, request: Request) -> TaskResponse:
     async with request.app.state.session_factory() as db:
-        session = await db.scalar(select(SessionRow).where(SessionRow.thread_id == body.thread_id))
+        session = await db.scalar(
+            select(SessionRow).where(SessionRow.thread_id == body.thread_id)
+        )
         if session is None or session.user_id != body.user_id:
             raise HTTPException(status_code=404, detail="session not found")
+
         row = TaskRow(
             user_id=body.user_id,
             thread_id=body.thread_id,
@@ -81,7 +129,11 @@ async def create_task(body: CreateTaskRequest, request: Request) -> TaskResponse
     )
 
 
-@app.get("/v1/tasks/{task_id}", response_model=TaskResponse)
+@app.get(
+    "/internal/v1/tasks/{task_id}",
+    response_model=TaskResponse,
+    tags=["internal"],
+)
 async def get_task(task_id: str, request: Request) -> TaskResponse:
     try:
         task_uuid = UUID(task_id)
