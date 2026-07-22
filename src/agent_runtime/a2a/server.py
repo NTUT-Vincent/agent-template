@@ -2,12 +2,19 @@ from __future__ import annotations
 
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
-from a2a.server.tasks import InMemoryTaskStore
+from a2a.server.tasks import DatabaseTaskStore
 from a2a.types import AgentCapabilities, AgentCard, AgentInterface, AgentSkill
+from sqlalchemy.ext.asyncio import AsyncEngine
 from starlette.applications import Starlette
 
 
-def create_a2a_app(*, executor, public_url: str) -> Starlette:
+async def create_a2a_app(*, executor, public_url: str, engine: AsyncEngine) -> Starlette:
+    """Build an A2A Protocol 1.0 server using the official A2A Python SDK.
+
+    A2A originated at Google and is now maintained by the A2A Project. The
+    official Python package remains ``a2a-sdk``. Task state is persisted in
+    PostgreSQL so A2A task lifecycle is not tied to a single Kubernetes Pod.
+    """
     skill = AgentSkill(
         id="general_agent",
         name="General enterprise agent",
@@ -29,9 +36,17 @@ def create_a2a_app(*, executor, public_url: str) -> Starlette:
         default_input_modes=["text/plain"],
         default_output_modes=["text/plain"],
     )
+
+    task_store = DatabaseTaskStore(
+        engine=engine,
+        create_table=True,
+        table_name="a2a_tasks",
+    )
+    await task_store.initialize()
+
     handler = DefaultRequestHandler(
         agent_executor=executor,
-        task_store=InMemoryTaskStore(),
+        task_store=task_store,
         agent_card=card,
     )
     routes = [*create_agent_card_routes(card), *create_jsonrpc_routes(handler, "/")]
