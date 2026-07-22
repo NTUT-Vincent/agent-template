@@ -1,8 +1,17 @@
+# Internal Background Worker Deployment
+#
+# 這組 Pod 只消費 Celery internal jobs：
+#
+#   app_tasks -> Redis/Celery -> worker -> AgentRuntimeService -> LangGraph -> Agent SDK
+#
+# A2A request 預設不走這個 worker；A2A 有自己的 Task lifecycle，直接進 shared runtime。
+
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: agent-runtime-worker
 spec:
+  # Worker 可以水平擴展，但同一 thread 的併發寫入仍要另外做 concurrency control。
   replicas: 2
   selector:
     matchLabels: {app: agent-runtime-worker}
@@ -13,7 +22,18 @@ spec:
       containers:
         - name: worker
           image: ghcr.io/REPLACE_ME/agent-runtime-platform:latest
-          command: ["celery", "-A", "agent_runtime.tasks.celery_app.celery_app", "worker", "-l", "INFO", "--concurrency=2"]
+
+          # 每個 worker process 收到的 queue payload 主要是 app_tasks.id。
+          # 真正 prompt/state 會再從 PostgreSQL / LangGraph persistence 讀取。
+          command:
+            - celery
+            - -A
+            - agent_runtime.tasks.celery_app.celery_app
+            - worker
+            - -l
+            - INFO
+            - --concurrency=2
+
           envFrom:
             - configMapRef: {name: agent-runtime-config}
             - secretRef: {name: agent-runtime-secrets}
