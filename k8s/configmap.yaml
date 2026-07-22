@@ -6,6 +6,7 @@ data:
   APP_ENV: prod
   API_HOST: 0.0.0.0
   API_PORT: "8000"
+  A2A_PUBLIC_URL: https://agent.example.com/a2a
   CLAUDE_MODEL: claude-sonnet-4-5
   CLAUDE_MAX_TURNS: "8"
   CLAUDE_PROJECT_KEY: agent-runtime
