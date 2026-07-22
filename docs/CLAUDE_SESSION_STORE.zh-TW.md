@@ -1,49 +1,53 @@
 # Claude Agent SDK SessionStore：跨 Pod Session 恢復指南
 
-這份文件專門說明本範本如何用 Claude Agent SDK 官方 `SessionStore` contract 解決 Kubernetes Pod 重啟後 session transcript 遺失的問題。
+這份文件專門說明本範本如何使用 Claude Agent SDK 官方 `SessionStore` contract，解決 Kubernetes Pod 重啟、換 node、multi-host 執行時 Claude native session transcript 無法只靠本機檔案保存的問題。
 
-官方文件：<https://code.claude.com/docs/en/agent-sdk/session-storage>
+相關文件：
+
+- [`../README.md`](../README.md)：整體架構摘要
+- [`TUTORIAL.zh-TW.md`](TUTORIAL.zh-TW.md)：完整 runtime 教學
+- 官方文件：<https://code.claude.com/docs/en/agent-sdk/session-storage>
 
 ---
 
-## 1. 問題是什麼？
+# 1. 問題：Pod local transcript 不可靠
 
-Claude Agent SDK 預設把 native session transcript 寫到 Pod 本地檔案系統：
+Claude Agent SDK native session 預設會有本機 transcript，例如：
 
 ```text
 ~/.claude/projects/.../<session-id>.jsonl
 ```
 
-Kubernetes Pod 是 ephemeral：
+但 Kubernetes Pod 是 ephemeral：
 
 ```text
 Pod A
   -> local transcript
   -> Pod 被重建
   -> Pod B
-  -> local transcript 不存在
+  -> Pod A filesystem 不存在
 ```
 
-所以不能把 Pod local filesystem 當成 production session source。
+因此 production 不能把 Pod local filesystem 當成唯一 session persistence。
 
 ---
 
-## 2. 官方 SessionStore 的模型
+# 2. 官方 SessionStore 的正確心智模型
 
-官方 SessionStore 是 external transcript mirror：
+SessionStore 是 **external transcript mirror**：
 
 ```text
-Claude Code subprocess
+Claude SDK / local JSONL
         |
-        | local JSONL first
+        | SessionStore.append()
         v
-SessionStore.append(...)
+External Store
         |
         v
 PostgreSQL
 ```
 
-resume 時：
+Resume：
 
 ```text
 ClaudeAgentOptions(resume=sdk_session_id)
@@ -55,30 +59,43 @@ SessionStore.load(...)
 restore transcript
         |
         v
-new Pod continues session
+new Pod continues native session
 ```
 
-重要：SessionStore 是 mirror，不是 transaction log。SDK 仍會先寫 local transcript，再 mirror 到 external store。
+非常重要：
+
+> **SessionStore 是 mirror，不是 transaction log，也不是 local transcript 的強一致 replacement。**
+
+所以：
+
+- mirror 需要 retry-safe
+- append 需要 dedupe
+- mirror failure 需要 observability
+- tool side effect 還是需要 idempotency
 
 ---
 
-## 3. 本範本保存兩種 session 資料
+# 3. 本範本其實保存三個不同 session/workflow state
 
-### Application mapping
+## 3.1 `app_sessions`
 
-`app_sessions`：
+Application mapping：
 
 ```text
 thread_id <-> sdk_session_id
 ```
 
-它回答：
+用途：
 
-> 這條 LangGraph thread 要 resume 哪一個 Claude native session？
+> 這條 LangGraph durable thread 應該 resume 哪一份 Claude native session？
 
-### Claude native transcript
+它不保存 transcript。
 
-`PostgresClaudeSessionStore`：
+---
+
+## 3.2 `PostgresClaudeSessionStore`
+
+保存 Claude Agent SDK native transcript：
 
 ```text
 project_key
@@ -86,50 +103,63 @@ session_id
 subpath
 seq
 entry_uuid
-entry
+entry JSONB
 mtime
 ```
 
 它回答：
 
-> 這個 Claude session 的 transcript entries 在哪裡？
-
-兩者缺一不可：
-
-```text
-thread_id
-   |
-   v
-sdk_session_id
-   |
-   v
-SessionStore transcript
-```
+> `sdk_session_id` 對應的 Claude transcript / subagent transcript 在哪？
 
 ---
 
-## 4. 為什麼不能只等 ResultMessage 才保存 session id？
+## 3.3 LangGraph PostgresSaver
+
+保存 workflow checkpoint：
+
+```text
+thread_id
+  -> graph state
+  -> node progress
+  -> interrupt/resume state
+```
+
+這不是 Claude transcript。
+
+---
+
+# 4. 為什麼不能只等 ResultMessage 才存 session ID？
 
 錯誤時序：
 
 ```text
 query()
-  -> SDK 建 session
-  -> transcript 已開始 mirror
-  -> Agent 執行很多 tool
+  -> SDK 建立 native session
+  -> transcript 開始 mirror
+  -> Agent 執行 tools
   -> Pod crash
-  -> 還沒收到 ResultMessage
+  -> 尚未收到 ResultMessage
 ```
 
-若 `app_sessions.sdk_session_id` 仍是 NULL，PostgreSQL 雖然可能已經有 transcript，application 卻不知道下一顆 Pod 要 resume 哪一份。
+此時可能變成：
 
-所以本範本使用 Python SDK init `SystemMessage.data["session_id"]`：
+```text
+PostgreSQL SessionStore
+  已有 sdk-abc transcript
+
+app_sessions
+  thread-001 -> NULL
+```
+
+也就是 transcript 還在，但 application 不知道該 resume 哪一份。
+
+所以本範本使用 init `SystemMessage`：
 
 ```text
 query()
   -> SystemMessage(subtype="init")
-  -> 立即取得 sdk_session_id
-  -> COMMIT app_sessions
+  -> data["session_id"] = sdk-abc
+  -> 立即 COMMIT app_sessions
   -> Agent 繼續執行
 ```
 
@@ -137,165 +167,65 @@ query()
 
 ```text
 src/agent_runtime/agent_sdk/claude.py
-src/agent_runtime/service.py
 src/agent_runtime/graph/builder.py
+src/agent_runtime/service.py
 ```
 
 ---
 
-## 5. Early session ID 如何穿過 LangGraph？
+# 5. Early session ID 如何穿過 LangGraph？
 
-不能把 Python callback 放進 checkpoint state，因為 callback 不可序列化。
+不能把 Python callback 放進 durable `AgentState`，因為 callback 不應被 checkpoint serialization。
 
-因此本範本放在 `GraphContext`：
+所以使用 `GraphContext`：
 
 ```text
 AgentRuntimeService
-  -> 建立 persist_session_id_early callback
+  -> 建立 persist_session_id_early()
   -> GraphContext(on_sdk_session_id=callback)
   -> LangGraph agent_sdk node
   -> ClaudeAgentExecutor.run(on_session_id=callback)
   -> init SystemMessage
-  -> callback
-  -> PostgreSQL app_sessions
+  -> callback(session_id)
+  -> COMMIT app_sessions
 ```
 
-`GraphContext` 是本次 invoke 的 runtime context，不是 durable graph state。
+`GraphContext` 是本次 invoke runtime context，不是 durable graph state。
 
 ---
 
-## 6. SessionStore append 為什麼一定要去重？
-
-官方 SessionStore mirror 是 best-effort，append 失敗會 retry。
-
-可能發生：
-
-```text
-append(batch A)
-  -> PostgreSQL 寫入成功
-  -> network response lost
-  -> SDK retry batch A
-```
-
-如果 adapter 只是盲目 INSERT，就會重複 transcript entries。
-
-官方建議使用 `entry.uuid` deduplicate。
-
-本範本因此新增：
-
-```text
-entry_uuid
-```
-
-以及 unique index：
-
-```text
-(project_key, session_id, subpath, entry_uuid)
-```
-
-INSERT 使用：
-
-```sql
-ON CONFLICT (...) DO NOTHING
-```
-
----
-
-## 7. 為什麼有 subpath？
-
-Claude subagent transcript 不是全部混在 main transcript。
-
-官方使用類似：
-
-```text
-subagents/agent-<id>
-```
-
-的 `subpath`。
-
-因此 SessionStore 必須：
-
-```text
-main transcript
-session_id = abc
-subpath = ""
-
-subagent transcript
-session_id = abc
-subpath = "subagents/agent-123"
-```
-
-resume 時 SDK 會呼叫 `list_subkeys()` 來找到 subagent transcripts。
-
----
-
-## 8. Session Summary sidecar
-
-本範本實作官方 optional：
-
-```python
-list_session_summaries()
-```
-
-並在 `append()` 內用：
-
-```python
-fold_session_summary(...)
-```
-
-維護 SDK-owned opaque summary。
-
-目的不是 Agent memory，而是讓 session listing 不必對每一個 session 都完整 `load()` transcript。
-
-請不要把 summary data 當成自己的 business schema；它是 SDK-owned state，應原樣保存。
-
----
-
-## 9. mirror_error
-
-官方規格中，external mirror 最終失敗不一定中止 Agent。
-
-SDK 會發出：
-
-```text
-SystemMessage(subtype="mirror_error")
-```
-
-本範本在 `ClaudeAgentExecutor` 中記錄 error log 與 `mirror_error_count`。
-
-代表：
-
-```text
-Agent 本輪可能成功
-但 PostgreSQL transcript 可能缺少某一 batch
-```
-
-Production 應把這個 log 接到 OTel / metrics / alert。
-
----
-
-## 10. Pod crash recovery 實際流程
-
-### 正常第一輪
+# 6. 完整第一輪時序
 
 ```text
 thread_id = thread-001
+sdk_session_id = NULL
 
-Pod A
-  -> Claude query
-  -> init session_id = sdk-abc
+AgentRuntimeService
+  -> graph.ainvoke(thread_id=thread-001)
+  -> ClaudeAgentExecutor
+  -> ClaudeAgentOptions(
+       resume=None,
+       session_store=PostgresClaudeSessionStore,
+       session_store_flush="eager"
+     )
+  -> query()
+  -> init session_id=sdk-abc
+  -> callback
   -> app_sessions COMMIT
-  -> eager SessionStore mirror
+  -> SDK continues
+  -> SessionStore.append()
   -> PostgreSQL transcript
+  -> ResultMessage
+  -> final consistency check
 ```
 
-### Pod crash
+ResultMessage 後仍會再保存一次 session ID，但它是 fallback / consistency check，不再是第一次 persistence point。
 
-```text
-Pod A dies
-```
+---
 
-外部資料仍有：
+# 7. 下一顆 Pod 如何 resume？
+
+Pod A crash 後，外部資料仍存在：
 
 ```text
 app_sessions
@@ -303,99 +233,343 @@ thread-001 -> sdk-abc
 
 claude_session_store
 sdk-abc -> transcript entries
+
+LangGraph checkpoint
+thread-001 -> workflow state
 ```
 
-### Pod B 接手
+Pod B：
 
 ```text
-Pod B
-  -> load thread-001
-  -> sdk_session_id = sdk-abc
+thread-001
+  -> app_sessions
+  -> sdk_session_id=sdk-abc
   -> ClaudeAgentOptions(resume="sdk-abc")
   -> SessionStore.load()
   -> restore transcript
-  -> continue
+  -> continue Claude native session
 ```
 
-因此 Pod 本身不再擁有 conversation identity。
+所以：
+
+> **Pod 不擁有 conversation identity；Pod 只是可替換 executor。**
 
 ---
 
-## 11. LangGraph Memory 仍然不要塞進 SessionStore
+# 8. `session_store_flush="eager"` 的角色
 
-這兩者責任不同：
+Template 使用：
+
+```python
+session_store_flush="eager"
+```
+
+目的：更積極把 local transcript mirror 到 external store，縮短 Pod crash 時 external store 落後的時間窗口。
+
+但它仍然不代表：
 
 ```text
-Claude SessionStore
-  -> native conversation transcript
-  -> tool calls/results
-  -> resume Claude session
+每一個 Claude frame
+與 PostgreSQL
+具有同步 transaction consistency
+```
 
+所以不能把 SessionStore 當成 exactly-once event log。
+
+---
+
+# 9. append 為什麼一定要 dedupe？
+
+Mirror retry 可能出現：
+
+```text
+append(batch A)
+  -> PostgreSQL 已成功
+  -> response/network lost
+  -> SDK retry batch A
+```
+
+盲目 INSERT 會造成 transcript 重複。
+
+因此本範本使用官方 entry 的：
+
+```text
+entry.uuid
+```
+
+保存成：
+
+```text
+entry_uuid
+```
+
+並建立：
+
+```text
+UNIQUE(project_key, session_id, subpath, entry_uuid)
+```
+
+寫入使用 conflict-safe insert。
+
+同一 session/subpath append 還會取得 PostgreSQL advisory transaction lock，保護：
+
+- append order
+- UUID dedupe check
+- session summary fold
+
+---
+
+# 10. `subpath` 為什麼重要？
+
+Claude subagent transcript 不是全部混在 main transcript。
+
+```text
+main transcript
+session_id = sdk-abc
+subpath = ""
+
+subagent transcript
+session_id = sdk-abc
+subpath = "subagents/agent-123"
+```
+
+SessionStore 實作：
+
+```python
+list_subkeys(...)
+```
+
+讓 SDK resume 時可以找到 subagent transcript。
+
+---
+
+# 11. Session Summary sidecar
+
+Template 也支援 SessionStore optional summary contract：
+
+```python
+fold_session_summary(...)
+list_session_summaries(...)
+```
+
+保存：
+
+```text
+project_key
+session_id
+mtime
+data JSONB
+```
+
+這份 summary 是 **SDK-owned opaque state**。
+
+用途是讓 session listing 不需要對每一份 session transcript 做完整 `load()`。
+
+不要把它當：
+
+- LangGraph memory
+- business schema
+- user profile store
+
+---
+
+# 12. `mirror_error`
+
+SessionStore external append 最終失敗時，Agent SDK 可能不停止 Agent，而是 emit：
+
+```text
+SystemMessage(subtype="mirror_error")
+```
+
+Template 的 `ClaudeAgentExecutor` 會：
+
+```text
+logger.error(...)
+mirror_error_count += 1
+```
+
+這代表：
+
+```text
+Agent 本輪可能成功
+但是 shared PostgreSQL transcript 可能缺某一批資料
+```
+
+Production 應該將它接到：
+
+- OpenTelemetry
+- structured logging
+- metrics
+- alert
+- SLO / incident monitoring
+
+收到 mirror error 後，不應假裝 cross-Pod resume durability 完全健康。
+
+---
+
+# 13. SessionStore 與 LangGraph Memory 的關係
+
+不要做：
+
+```text
+Claude transcript
+  -> 全量 copy 到 LangGraph memory
+```
+
+也不要：
+
+```text
+LangGraph memory
+  -> 全量寫進 Claude transcript
+```
+
+正確模型：
+
+```text
 LangGraph PostgresStore
-  -> long-term application memory
-  -> user preference
-  -> domain fact
-  -> past decision
+   -> retrieve relevant facts/preferences/decisions
+   -> memory_context
+   -> Claude Agent SDK
+
+Claude SessionStore
+   -> native conversation/tool continuity
+
+Agent result
+   -> memory extraction / policy
+   -> LangGraph PostgresStore
 ```
 
-執行時：
+所以：
 
 ```text
-PostgresStore
-  -> retrieve relevant memory
-  -> memory_context
-  -> Agent SDK
+Memory     = application knowledge
+Session    = native conversation transcript
+Checkpoint = workflow state
 ```
-
-執行完再經過 memory extraction 寫回 PostgresStore。
-
-不要把完整 transcript 同時複製成 LangGraph long-term memory。
 
 ---
 
-## 12. CI 驗證
+# 14. SessionStore 不等於 exactly-once
 
-本範本不是自己猜 SessionStore 規則，而是直接跑官方 Python SDK conformance suite：
+例子：
+
+```text
+Claude
+  -> MCP tool 寫外部資料成功
+  -> Pod crash
+  -> workflow/job retry
+  -> MCP tool 再執行
+```
+
+SessionStore 不會阻止 business side effect 重複。
+
+Side-effect tool 必須另外設計：
+
+- idempotency key
+- unique constraint
+- upsert
+- execution record
+- transaction
+- outbox
+- compensation strategy
+
+---
+
+# 15. 官方 conformance test
+
+本範本直接使用 Claude Agent SDK 官方 conformance suite：
 
 ```python
 from claude_agent_sdk.testing import run_session_store_conformance
 ```
 
-CI 會啟動 PostgreSQL service，再對 `PostgresClaudeSessionStore` 驗證 append/load/order/subpath/list/delete/summary 等 contract。
-
-檔案：
+測試：
 
 ```text
 tests/test_claude_session_store_conformance.py
-.github/workflows/ci.yml
 ```
+
+CI 會啟動 PostgreSQL service，驗證 adapter contract，包括：
+
+- append / load round trip
+- append order
+- unknown session
+- subpath isolation
+- project isolation
+- list sessions
+- delete
+- list subkeys
+- session summaries
+
+這比只自己猜幾個 unit test case 更可靠。
 
 ---
 
-## 13. SessionStore 不等於 exactly-once
+# 16. Recovery 保證與限制
 
-最後仍要記住：
-
-```text
-SessionStore durability != business side-effect exactly once
-```
-
-例如：
+Template 能提供的合理 recovery contract：
 
 ```text
-Claude
-  -> MCP tool 寫資料成功
-  -> Pod crash
-  -> workflow retry
-  -> tool 再執行一次
+LangGraph workflow state
+    -> PostgreSQL
+
+Claude native transcript
+    -> PostgreSQL SessionStore mirror
+
+thread_id <-> sdk_session_id
+    -> app_sessions PostgreSQL
+
+A2A Task state
+    -> A2A DatabaseTaskStore PostgreSQL
+
+Internal Task state
+    -> app_tasks PostgreSQL
 ```
 
-因此 side-effect tool 還是要有：
+但仍有兩個重要限制：
 
-- idempotency key
-- unique constraint
-- execution record
-- transaction / outbox
-- compensation strategy
+## 16.1 init 前 crash
 
-SessionStore 解決的是 **conversation resume**，不是 distributed transaction。
+如果新的 Claude session 尚未 emit init session ID，Pod 就死亡，application 還沒有 SDK session identity 可以保存。
+
+這是目前由 SDK 產生 session ID 時的 lifecycle boundary。
+
+## 16.2 Mirror 是 best-effort
+
+SessionStore 不是 distributed transaction log。
+
+即使使用 eager flush，仍應對 mirror error、tool idempotency、workflow retry 做完整設計。
+
+---
+
+# 17. 最終圖
+
+```text
+                       PostgreSQL
+          +----------------+------------------+
+          |                |                  |
+          v                v                  v
+     app_sessions    Claude SessionStore   LangGraph
+     thread <-> sdk   transcript/subagent   checkpoint
+          |                |                  |
+          +----------------+---------+--------+
+                                     |
+                                     v
+                                Kubernetes Pod
+                                     |
+                                     v
+                                  LangGraph
+                                     |
+                                     v
+                             ClaudeAgentExecutor
+                                     |
+                                     v
+                              Claude Agent SDK
+                                     |
+                                     v
+                              MCP / Tools / LLM
+```
+
+一句話總結：
+
+> **跨 Pod resume 需要同時保存「哪一個 session」與「那個 session 的 transcript」：`app_sessions` 保存 identity mapping，SessionStore 保存 native transcript；LangGraph 則另外保存 workflow state。**
