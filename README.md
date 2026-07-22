@@ -1,6 +1,6 @@
 # Agent Runtime Platform
 
-A minimal Kubernetes-oriented agent framework built around **LangGraph + PostgreSQL + Claude Agent SDK + A2A + Celery/Redis**.
+A minimal Kubernetes-oriented agent framework built around **LangGraph + PostgreSQL + Claude Agent SDK + the official A2A Python SDK + Celery/Redis**.
 
 The goal is to keep each durability concern separate:
 
@@ -9,7 +9,9 @@ Client / Generative UI
         |
         v
      FastAPI ---------------- A2A JSON-RPC
-        |
+        |                         |
+        |                         +-- Official A2A Python SDK
+        |                         +-- PostgreSQL a2a_tasks
         v
    PostgreSQL app_tasks
         |
@@ -45,6 +47,7 @@ Client / Generative UI
 5. If the task sets `remember=true`, the graph writes the interaction into `PostgresStore`.
 6. The SDK transcript is mirrored to Postgres with eager flush.
 7. The worker stores the result and latest `sdk_session_id` back into PostgreSQL.
+8. A2A requests are handled by the official A2A Python SDK; A2A task lifecycle is persisted in PostgreSQL through `DatabaseTaskStore`.
 
 ## Run locally
 
@@ -87,6 +90,7 @@ curl -s http://localhost:8000/v1/tasks/TASK_ID
 | Workflow checkpoint | `AsyncPostgresSaver` |
 | Cross-session memory | `AsyncPostgresStore` |
 | Claude native transcript | `PostgresClaudeSessionStore` |
+| A2A protocol task lifecycle | Official `DatabaseTaskStore` → PostgreSQL `a2a_tasks` |
 | Queue / backpressure | Redis + Celery |
 | Business data | Your domain DB / MCP services |
 
@@ -101,7 +105,6 @@ Do not equate queue delivery with workflow state. A lost Redis job should be rec
 - Add an outbox pattern so `app_tasks` creation and queue publication cannot diverge.
 - Add idempotency keys around side-effecting MCP/tool calls.
 - Add task cancellation, timeout/deadline propagation and graceful worker shutdown.
-- Use a persistent A2A `TaskStore` instead of `InMemoryTaskStore` before exposing A2A in production.
 - Add SSE/WebSocket event fan-out for live UI updates; do not use the stream as the source of truth.
 - Add OTel collector, trace IDs, structured logs and audit tables.
 - Encrypt or strictly control checkpoint/session data; `LANGGRAPH_STRICT_MSGPACK=true` is set by default.
@@ -110,12 +113,22 @@ Do not equate queue delivery with workflow state. A lost Redis job should be rec
 
 `k8s/` contains API and worker Deployments plus example config. In production, PostgreSQL and Redis should normally be managed/external services.
 
-The API and worker Pods are intentionally stateless. Native Claude Agent SDK transcripts are mirrored to PostgreSQL so a worker restart or re-scheduling does not require a sticky Pod.
+The API and worker Pods are intentionally stateless. Native Claude Agent SDK transcripts and A2A task state are persisted in PostgreSQL so worker/API restarts do not require sticky Pods.
 
 ## A2A
 
-`agent_runtime.a2a` contains a protocol bridge using the official A2A Python SDK. The bridge delegates requests to the same task/runtime layer. For production, back A2A task state with PostgreSQL and validate all remote Agent Card/message/artifact input as untrusted.
+This project uses the **official A2A Python SDK**, installed as `a2a-sdk`. A2A was originally introduced by Google; the protocol and SDKs are now maintained under the independent A2A Project (`a2aproject/a2a-python`). This is not the third-party `python-a2a` package.
+
+`agent_runtime.a2a` uses official SDK components including:
+
+- `AgentExecutor` / `RequestContext`
+- `EventQueue` / `TaskUpdater`
+- `DefaultRequestHandler`
+- Agent Card and JSON-RPC route helpers
+- `DatabaseTaskStore` backed by PostgreSQL
+
+The bridge delegates business execution to the existing LangGraph + Agent SDK runtime instead of creating another agent loop.
 
 ## Package versions used when scaffolded
 
-Scaffolded July 2026 against the then-current major lines: LangGraph 1.2.x, `langgraph-checkpoint-postgres` 3.1.x, Claude Agent SDK 0.2.x and A2A SDK 1.1.x.
+Scaffolded July 2026 against the then-current major lines: LangGraph 1.2.x, `langgraph-checkpoint-postgres` 3.1.x, Claude Agent SDK 0.2.x and official A2A Python SDK 1.1.x.
